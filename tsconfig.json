@@ -15,5 +15,5 @@
     "noImplicitAny": false,
     "allowJs": true
   },
-  "include": ["src"]
+  "include": ["."]
 }
