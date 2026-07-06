@@ -284,6 +284,10 @@ const CSS = `
   --gold:#c19a3f; --gold2:#a37f2c;
   --stamp:#a3342a; --green:#41603f;
 }
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--paper)}
+button{font:inherit;color:inherit;background:transparent;border:0;padding:0;margin:0;text-align:center;-webkit-appearance:none;appearance:none;border-radius:0;cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:rgba(95,28,34,.2)}
+input,select,textarea{font:inherit;color:inherit}
 .mtn{min-height:100vh;background:var(--paper);color:var(--ink);-webkit-font-smoothing:antialiased}
 .f-deco{font-family:"Didot","Bodoni 72","Playfair Display",Georgia,serif}
 .f-caps{font-family:"Copperplate","Futura","Trebuchet MS",serif;text-transform:uppercase}
@@ -293,7 +297,7 @@ const CSS = `
 .film{height:12px;background:#171310;background-image:radial-gradient(circle 2.6px at 9px 6px,var(--paper) 97%,transparent);background-size:18px 12px;background-repeat:repeat-x}
 .masthead{background:var(--maroon);color:var(--gold);padding:12px 16px 10px;border-bottom:3px double var(--gold)}
 .bulbs{height:9px;background:var(--maroon2);background-image:radial-gradient(circle 2px at 8px 4.5px,var(--gold) 96%,transparent);background-size:16px 9px;background-repeat:repeat-x;border-bottom:1px solid var(--gold2)}
-.mast-title{font-size:30px;letter-spacing:.14em;line-height:1;font-weight:600}
+.mast-title{font-size:clamp(19px,6.4vw,30px);letter-spacing:.14em;line-height:1;font-weight:600;white-space:nowrap}
 .mast-star{font-size:14px;letter-spacing:.3em;vertical-align:6px}
 .mast-sub{font-size:9px;letter-spacing:.32em;color:#e6d9ae;margin-top:4px}
 .clockbox{border:1px solid var(--gold);padding:5px 10px 3px;text-align:center;background:var(--maroon2)}
@@ -301,8 +305,7 @@ const CSS = `
 .clockbox .c{font-size:7.5px;letter-spacing:.3em;color:var(--gold);margin-top:3px}
 
 .tabs{display:grid;grid-template-columns:repeat(4,1fr);background:var(--maroon2);border-bottom:3px double var(--gold)}
-.tab{padding:9px 2px;text-align:center;font-size:10.5px;letter-spacing:.14em;color:#cdb briefly}
-.tab{color:#cdbd8f;border-right:1px solid rgba(193,154,63,.35)}
+.tab{padding:9px 2px;text-align:center;font-size:10.5px;letter-spacing:.14em;background:transparent;color:#cdbd8f;border-right:1px solid rgba(193,154,63,.35)}
 .tab:last-child{border-right:0}
 .tab.on{background:var(--gold);color:var(--maroon2);font-weight:700}
 
@@ -365,7 +368,7 @@ select.fld{padding:3px 0 2px}
 .footer{padding:26px 0 8px;text-align:center}
 input[type=time].fld,input[type=number].fld{-webkit-appearance:none;appearance:none}
 input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
-button{cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:rgba(95,28,34,.2)}
+button{cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:rgba(95,28,34,.2);background:transparent;border:0;color:inherit;font:inherit;-webkit-appearance:none;appearance:none;border-radius:0}
 .act{box-shadow:2px 2px 0 var(--ink);transition:transform .06s,box-shadow .06s}
 .act:active{transform:translate(2px,2px);box-shadow:0 0 0 var(--ink)}
 .act.gold{box-shadow:2px 2px 0 var(--gold2)}
