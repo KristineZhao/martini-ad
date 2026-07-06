@@ -36,6 +36,13 @@ const fClk = (mAbs) => {
 };
 const nowHHMM = (d) => String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
 const money = (n) => "$" + (n || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+const money2 = (n) => "$" + (n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const addMin = (hhmm, mins) => {
+  const t = t2m(hhmm);
+  if (t == null) return "";
+  const v = (((t + mins) % 1440) + 1440) % 1440;
+  return String(Math.floor(v / 60)).padStart(2, "0") + ":" + String(v % 60).padStart(2, "0");
+};
 
 /* ---------------- default rule profiles ---------------- */
 const DEFAULT_PROFILES = [
@@ -96,6 +103,34 @@ const STRIP = {
   "EXT-NIGHT": "#7ea578",
 };
 
+/* ---------------- device persistence (auto-detects; preview falls back to session-only) ---------------- */
+const STORE_KEY = "martini_v1";
+const store = (() => {
+  try {
+    const t = "__martini_probe__";
+    window.localStorage.setItem(t, "1");
+    window.localStorage.removeItem(t);
+    return window.localStorage;
+  } catch (e) { return null; }
+})();
+const SAVED = (() => {
+  try {
+    const v = store ? store.getItem(STORE_KEY) : null;
+    return v ? JSON.parse(v) : null;
+  } catch (e) { return null; }
+})();
+if (SAVED) {
+  const bump = (it) => { const n = parseInt(it && it.id, 10); if (!Number.isNaN(n) && n > _id) _id = n; };
+  (SAVED.people || []).forEach(bump);
+  (SAVED.scenes || []).forEach(bump);
+  (SAVED.archive || []).forEach((a) => { (a.people || []).forEach(bump); (a.scenes || []).forEach(bump); });
+}
+const pick = (k, d) => (SAVED && SAVED[k] !== undefined && SAVED[k] !== null ? SAVED[k] : d);
+const mergeById = (saved, defaults) => {
+  if (!saved) return defaults;
+  return defaults.map((d) => { const f = saved.find((x) => x && x.id === d.id); return f ? { ...d, ...f } : d; });
+};
+
 /* ---------------- calculation engine ---------------- */
 function mealChecks(callA, m1o, m1i, m2o, endA, prof, hourly) {
   const int = prof.mealInt * 60;
@@ -127,14 +162,20 @@ function calcPerson(p, prof, bands, schoolDay, liveNowAbs) {
   const [c, m1o, m1i, m2o, m2i, w0] = seqAbs([
     call, t2m(p.m1o), t2m(p.m1i), t2m(p.m2o), t2m(p.m2i), t2m(p.wrap),
   ]);
-  let end = w0, live = false;
+  let end = w0, live = false, sched = null;
   if (end == null) {
     if (liveNowAbs == null) return { empty: true };
     end = Math.max(liveNowAbs, c); live = true;
+  } else if (liveNowAbs != null && liveNowAbs >= c && liveNowAbs < end) {
+    sched = end;
+    end = liveNowAbs;
+    live = true;
   }
-  const dRaw1 = m1o != null && m1i != null ? Math.min(Math.max(m1i - m1o, 0), 60) : 0;
+  const past = (t) => (t != null && t <= end ? t : null);
+  const m1oE = past(m1o), m1iE = past(m1i), m2oE = past(m2o), m2iE = past(m2i);
+  const dRaw1 = m1oE != null && m1iE != null ? Math.min(Math.max(m1iE - m1oE, 0), 60) : 0;
   const d1 = dRaw1 >= 30 ? dRaw1 : 0;
-  const dRaw2 = m2o != null && m2i != null ? Math.min(Math.max(m2i - m2o, 0), 60) : 0;
+  const dRaw2 = m2oE != null && m2iE != null ? Math.min(Math.max(m2iE - m2oE, 0), 60) : 0;
   const d2 = dRaw2 >= 30 ? dRaw2 : 0;
   const span = end - c;
   const worked = Math.max(0, span - d1 - d2) / 60;
@@ -148,7 +189,7 @@ function calcPerson(p, prof, bands, schoolDay, liveNowAbs) {
   const ot3 = Math.max(0, worked - T3);
   const otPay = hourly * (ot1 * prof.m1 + ot2 * prof.m2 + ot3 * (prof.m3 || 0));
 
-  const meals = mealChecks(c, m1o, m1i, m2o, end, prof, hourly);
+  const meals = mealChecks(c, m1oE, m1iE, m2oE, end, prof, hourly);
 
   let earliestNext = null, forced = false, forcedPen = 0, gap = null;
   const nc = t2m(p.next);
@@ -164,6 +205,12 @@ function calcPerson(p, prof, bands, schoolDay, liveNowAbs) {
       }
     }
   }
+  const ru = t2m(p.restUntil);
+  if (ru != null && prof.turnaround > 0 && call < ru) {
+    forced = true;
+    gap = prof.turnaround * 60 - (ru - call);
+    forcedPen = Math.max(forcedPen, prof.forcedCap != null ? Math.min(rate, prof.forcedCap) : 0);
+  }
 
   const warnings = [];
   const band = p.minorBand ? bands.find((b) => b.id === p.minorBand) : null;
@@ -172,6 +219,10 @@ function calcPerson(p, prof, bands, schoolDay, liveNowAbs) {
     if (worked > maxW) warnings.push("MINOR OVER WORK LIMIT — " + fHM(worked * 60) + " vs " + maxW + "h max");
     if (span / 60 > band.set) warnings.push("MINOR OVER ON-SET LIMIT — " + fHM(span) + " vs " + band.set + "h max");
     if (ot1 + ot2 + ot3 > 0) warnings.push("MINOR IN OVERTIME — not permitted");
+  }
+  if (!band) {
+    if (prof.t2 != null && worked > prof.t2) warnings.push("DOUBLE TIME — " + fHM((worked - prof.t2) * 60) + " past " + prof.t2 + "h @ " + prof.m2 + "x");
+    if (prof.t3 != null && worked > prof.t3) warnings.push("GOLDEN HOURS — past " + prof.t3 + "h @ " + (prof.m3 || 0) + "x");
   }
   if (meals.ct > 0) warnings.push(meals.ct + " MEAL PENALT" + (meals.ct > 1 ? "IES" : "Y") + " — " + money(meals.amt));
   if (forced) warnings.push("FORCED CALL — rest " + fHM(gap) + " under " + prof.turnaround + "h" + (forcedPen ? " (" + money(forcedPen) + ")" : ""));
@@ -182,29 +233,36 @@ function calcPerson(p, prof, bands, schoolDay, liveNowAbs) {
   }
 
   const total = rate + otPay + meals.amt + forcedPen;
+  const paidH = Math.min(worked, prof.base) + ot1 * prof.m1 + ot2 * prof.m2 + ot3 * (prof.m3 || 0);
+  const meterW = live ? hourly * paidH : rate + otPay;
+  const meter = meterW + meals.amt + forcedPen;
   return {
-    empty: false, live, c, end, span, worked, ded: d1 + d2,
+    empty: false, live, sched, c, end, span, worked, ded: d1 + d2,
     ot1, ot2, ot3, otPay, hourly, meals, earliestNext, forced, forcedPen,
-    warnings, total, band,
+    warnings, total, meter, meterW, band,
   };
 }
 
 /* next scheduled rest / release for someone still on the clock */
 function nextRest(p, r, prof, schoolDay, nAbs) {
-  if (r.empty || !r.live || !prof) return null;
+  if (r.empty || !prof) return null;
+  if (!(r.live || (nAbs >= r.c && nAbs < r.end))) return null;
   const cands = [];
   const m1o = t2m(p.m1o), m1i = t2m(p.m1i), m2o = t2m(p.m2o);
   if (m1o == null) {
     cands.push({ at: r.c + prof.mealInt * 60, label: "1st meal break due" });
-  } else if (m1i != null && m2o == null) {
-    const [, , m1iA] = seqAbs([t2m(p.call), m1o, m1i]);
-    cands.push({ at: m1iA + prof.mealInt * 60, label: "2nd meal break due" });
+  } else {
+    const [, m1oA, m1iA] = seqAbs([t2m(p.call), m1o, m1i]);
+    if (nAbs < m1oA) cands.push({ at: m1oA, label: "lunch break scheduled" });
+    if (m1i != null && m2o == null) cands.push({ at: m1iA + prof.mealInt * 60, label: "2nd meal break due" });
   }
   const assumedDed = r.ded > 0 ? r.ded : (m1o == null ? 60 : 0);
   cands.push({ at: r.c + prof.base * 60 + assumedDed, label: prof.m1 + "x overtime begins" });
+  if (prof.t2 != null) cands.push({ at: r.c + prof.t2 * 60 + assumedDed, label: prof.m2 + "x double time begins" });
+  if (prof.t3 != null) cands.push({ at: r.c + prof.t3 * 60 + assumedDed, label: (prof.m3 || 0) + "x golden hours begin" });
   if (r.band) {
     const maxW = schoolDay ? r.band.workS : r.band.workN;
-    cands.push({ at: nAbs + (maxW - r.worked) * 60, label: "minor hits " + maxW + "h work limit" });
+    if (r.live) cands.push({ at: nAbs + (maxW - r.worked) * 60, label: "minor hits " + maxW + "h work limit" });
     cands.push({ at: r.c + r.band.set * 60, label: "minor must leave set" });
   }
   const nc = t2m(p.next);
@@ -307,6 +365,59 @@ select.fld{padding:3px 0 2px}
 .footer{padding:26px 0 8px;text-align:center}
 input[type=time].fld,input[type=number].fld{-webkit-appearance:none;appearance:none}
 input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+button{cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:rgba(95,28,34,.2)}
+.act{box-shadow:2px 2px 0 var(--ink);transition:transform .06s,box-shadow .06s}
+.act:active{transform:translate(2px,2px);box-shadow:0 0 0 var(--ink)}
+.act.gold{box-shadow:2px 2px 0 var(--gold2)}
+.act.gold:active{box-shadow:0 0 0 var(--gold2)}
+.act.arm{background:var(--stamp);border-color:var(--stamp);color:var(--paper);font-weight:700;box-shadow:2px 2px 0 var(--maroon2)}
+.punch{box-shadow:2px 2px 0 var(--ink);transition:transform .06s,box-shadow .06s}
+.punch:active{transform:translate(2px,2px);box-shadow:0 0 0 var(--ink)}
+.punch.set{box-shadow:2px 2px 0 var(--maroon2)}
+.tab:active{opacity:.7}
+.tclear:active,.chk:active{transform:scale(.88)}
+.clr:active{opacity:.7}
+
+/* ---- art deco dimensionals ---- */
+.masthead{position:relative;overflow:hidden}
+.masthead::before{content:"";position:absolute;inset:-45% -15%;background:repeating-conic-gradient(from -88deg at 16% 118%,rgba(232,201,106,.11) 0deg 5deg,transparent 5deg 12deg);pointer-events:none}
+.masthead > *{position:relative}
+.gold-metal{background:linear-gradient(105deg,#7a5a1c 0%,#c9a23f 18%,#f7e7a0 36%,#ffe9a3 42%,#c9a23f 56%,#8a6a24 76%,#e0bd66 100%);background-size:220% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;animation:sheen 6s ease-in-out infinite}
+@keyframes sheen{0%,100%{background-position:0% 0}50%{background-position:100% 0}}
+.bulbs{animation:chase .95s steps(2) infinite}
+@keyframes chase{to{background-position-x:16px}}
+.clockbox{background:radial-gradient(130% 170% at 50% 0%,#5c1b21,#3d1115 72%);box-shadow:inset 0 0 10px rgba(0,0,0,.55),0 0 0 1px rgba(247,231,160,.22),0 1px 6px rgba(0,0,0,.35)}
+.clockbox .t{text-shadow:0 0 9px rgba(241,227,181,.5)}
+.tab.on{background:linear-gradient(180deg,#ecd27a,#c19a3f 55%,#9d7d2e);text-shadow:0 1px 0 rgba(255,255,255,.35)}
+.card{position:relative;animation:rise .4s ease-out both;transform-origin:50% 100%}
+.card::after{content:"";position:absolute;inset:3px;border:1px solid rgba(193,154,63,.5);pointer-events:none}
+.tk{animation:rise .32s ease-out both;transform-origin:50% 100%}
+@keyframes rise{from{opacity:0;transform:perspective(900px) rotateX(7deg) translateY(16px)}to{opacity:1;transform:perspective(900px) rotateX(0) translateY(0)}}
+.stamp{animation:slam .34s cubic-bezier(.2,1.5,.35,1) both}
+@keyframes slam{0%{opacity:0;transform:scale(2.1) rotate(-13deg)}62%{opacity:1;transform:scale(.94) rotate(0)}100%{opacity:1;transform:scale(1) rotate(-2deg)}}
+.act:active{transform:perspective(420px) rotateX(7deg) translate(1px,2px);box-shadow:0 0 0 var(--ink)}
+.punch:active{transform:perspective(420px) rotateX(7deg) translate(1px,2px);box-shadow:0 0 0 var(--ink)}
+.headline .r{position:relative}
+.headline .r::after{content:"◆";position:absolute;right:-1px;top:-8px;color:var(--gold2);font-size:8px}
+/* ---- grand opening: velvet + gold ---- */
+.curtain{position:fixed;inset:0;z-index:60;overflow:hidden;perspective:1000px}
+.cur-h{position:absolute;top:-2%;bottom:-2%;width:55%;background:repeating-linear-gradient(90deg,#3f0d13 0px,#711e27 14px,#4d1219 30px,#3f0d13 46px);box-shadow:inset 0 -60px 90px rgba(0,0,0,.55),inset 0 40px 60px rgba(0,0,0,.35)}
+.cur-h::after{content:"";position:absolute;top:0;bottom:0;width:12px;background:repeating-linear-gradient(180deg,var(--gold) 0px,var(--gold) 12px,rgba(193,154,63,.12) 12px,rgba(193,154,63,.12) 17px);opacity:.9}
+.cur-l{left:-2%;transform-origin:left center;animation:partL 2.3s cubic-bezier(.6,.05,.32,1) forwards}
+.cur-r{right:-2%;transform-origin:right center;animation:partR 2.3s cubic-bezier(.6,.05,.32,1) forwards}
+.cur-l::after{right:0}
+.cur-r::after{left:0}
+@keyframes partL{0%,41%{transform:translateX(0) rotateY(0)}100%{transform:translateX(-110%) rotateY(16deg)}}
+@keyframes partR{0%,41%{transform:translateX(0) rotateY(0)}100%{transform:translateX(110%) rotateY(-16deg)}}
+.cur-title{position:absolute;left:0;right:0;top:32%;text-align:center;z-index:2;animation:titleArc 2.5s ease both}
+@keyframes titleArc{0%{opacity:0;transform:scale(.65)}16%,64%{opacity:1;transform:scale(1)}100%{opacity:0;transform:scale(1.6)}}
+.cur-title .big{font-size:clamp(24px,8vw,36px);letter-spacing:.16em;color:#f2d788;text-shadow:0 0 14px rgba(236,201,106,.55),0 1px 0 rgba(0,0,0,.4)}
+.cur-title .small{margin-top:9px;font-size:9px;letter-spacing:.34em;color:#d9c07a}
+.cur-rays{position:absolute;left:50%;top:50%;width:340px;height:340px;margin:-170px 0 0 -170px;z-index:-1;background:repeating-conic-gradient(from 0deg,rgba(232,201,106,.16) 0deg 6deg,transparent 6deg 14deg);border-radius:50%;animation:spin 14s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.gold-metal,.bulbs,.card,.tk,.stamp,.cur-h,.cur-title,.cur-rays{animation:none}}
+.trow{display:flex;align-items:flex-end;gap:4px}
+.tclear{flex:0 0 auto;width:17px;height:17px;border:1px solid var(--edge);border-radius:50%;background:transparent;color:var(--faded);font-size:9px;line-height:1;display:flex;align-items:center;justify-content:center;padding:0;margin-bottom:3px}
 `;
 
 /* ---------------- tiny atoms ---------------- */
@@ -318,7 +429,10 @@ const Fld = ({ label, children }) => (
 );
 const TIn = ({ label, value, onChange }) => (
   <Fld label={label}>
-    <input type="time" className="fld" value={value} onChange={(e) => onChange(e.target.value)} />
+    <div className="trow">
+      <input type="time" className="fld" style={{ flex: 1 }} value={value} onChange={(e) => onChange(e.target.value)} />
+      {value ? <button className="tclear" onClick={() => onChange("")} aria-label="clear time">✕</button> : null}
+    </div>
   </Fld>
 );
 const NIn = ({ label, value, onChange, placeholder }) => (
@@ -345,26 +459,59 @@ const Head = ({ children, right }) => (
   </div>
 );
 
+const Curtain = ({ label, sub, onDone }) => {
+  useEffect(() => {
+    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const id = window.setTimeout(onDone, reduce ? 250 : 2600);
+    return () => window.clearTimeout(id);
+  }, [onDone]);
+  return (
+    <div className="curtain" onClick={onDone}>
+      <div className="cur-title">
+        <div className="cur-rays" />
+        <div className="f-deco big">{label}</div>
+        <div className="f-caps small">{sub}</div>
+      </div>
+      <div className="cur-h cur-l" />
+      <div className="cur-h cur-r" />
+    </div>
+  );
+};
+
 /* ================================================================ */
 export default function App() {
   const [tab, setTab] = useState("ops");
-  const [profiles, setProfiles] = useState(DEFAULT_PROFILES);
-  const [bands, setBands] = useState(DEFAULT_BANDS);
-  const [schoolDay, setSchoolDay] = useState(false);
-  const [people, setPeople] = useState(SAMPLE_PEOPLE);
-  const [scenes, setScenes] = useState(SAMPLE_SCENES);
-  const [day, setDay] = useState({ crewCall: "07:00", firstShot: "08:00", schedWrap: "19:00" });
-  const [log, setLog] = useState({ shot: "", m1o: "", m1i: "", wrap: "" });
-  const [companyProfile, setCompanyProfile] = useState("iatse");
-  const [fringePct, setFringePct] = useState(21);
-  const [budgetTarget, setBudgetTarget] = useState(15000);
+  const [profiles, setProfiles] = useState(() => mergeById(SAVED && SAVED.profiles, DEFAULT_PROFILES));
+  const [bands, setBands] = useState(() => mergeById(SAVED && SAVED.bands, DEFAULT_BANDS));
+  const [schoolDay, setSchoolDay] = useState(() => pick("schoolDay", false));
+  const [people, setPeople] = useState(() => pick("people", SAMPLE_PEOPLE));
+  const [scenes, setScenes] = useState(() => pick("scenes", SAMPLE_SCENES));
+  const [day, setDay] = useState(() => pick("day", { crewCall: "07:00", firstShot: "08:00", schedWrap: "19:00" }));
+  const [log, setLog] = useState(() => pick("log", { shot: "", m1o: "", m1i: "", wrap: "" }));
+  const [companyProfile, setCompanyProfile] = useState(() => pick("companyProfile", "iatse"));
+  const [fringePct, setFringePct] = useState(() => pick("fringePct", 21));
+  const [budgetTarget, setBudgetTarget] = useState(() => pick("budgetTarget", 15000));
   const [report, setReport] = useState(null);
+  const [shootDay, setShootDay] = useState(() => pick("shootDay", 1));
+  const [armNewDay, setArmNewDay] = useState(false);
+  const [armMartini, setArmMartini] = useState(false);
+  const [armFactory, setArmFactory] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [archive, setArchive] = useState(() => pick("archive", []));
+  const [viewDay, setViewDay] = useState(0);
+  const [curtain, setCurtain] = useState(() => ({ run: 1, label: SAVED ? "Shoot Day " + pick("shootDay", 1) : "Martini", sub: SAVED ? "Resuming production" : "Digital First Assistant Director" }));
 
   const [now, setNow] = useState(new Date());
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(t);
   }, []);
+  useEffect(() => {
+    if (!store) return;
+    try {
+      store.setItem(STORE_KEY, JSON.stringify({ people, scenes, day, log, shootDay, archive, profiles, bands, schoolDay, fringePct, budgetTarget, companyProfile }));
+    } catch (e) {}
+  }, [people, scenes, day, log, shootDay, archive, profiles, bands, schoolDay, fringePct, budgetTarget, companyProfile]);
   const nowMin = now.getHours() * 60 + now.getMinutes() + now.getSeconds() / 60;
 
   const profOf = (id) => profiles.find((x) => x.id === id);
@@ -412,7 +559,7 @@ export default function App() {
 
   /* ---------- per-person ---------- */
   const calcs = people.map((p) => ({ p, r: calcPerson(p, profOf(p.profileId), bands, schoolDay, nAbs) }));
-  let sumBase = 0, sumOT = 0, sumPen = 0, sumForced = 0, sumTotal = 0;
+  let sumBase = 0, sumOT = 0, sumPen = 0, sumForced = 0, sumTotal = 0, sumMeter = 0, sumMeterW = 0;
   for (const { p, r } of calcs) {
     if (r.empty) continue;
     sumBase += Number(p.rate) || 0;
@@ -420,46 +567,132 @@ export default function App() {
     sumPen += r.meals.amt;
     sumForced += r.forcedPen;
     sumTotal += r.total;
+    sumMeter += r.meter;
+    sumMeterW += r.meterW;
   }
   const fringes = (sumBase + sumOT) * (Number(fringePct) || 0) / 100;
   const grand = sumTotal + fringes;
+  const meterGrand = sumMeterW * (1 + (Number(fringePct) || 0) / 100) + (sumMeter - sumMeterW);
 
   /* ---------- actions ---------- */
   const stamp = (f) => setLog((l) => ({ ...l, [f]: nowHHMM(new Date()) }));
-  const syncToSheets = () => setPeople((list) => list.map((p) => ({
-    ...p,
-    call: p.call || day.crewCall,
-    m1o: p.m1o || log.m1o,
-    m1i: p.m1i || log.m1i,
-    wrap: p.wrap || log.wrap,
-  })));
-  const addPerson = () => setPeople((l) => [...l, { id: nid(), name: "", dept: "", profileId: "iatse", rate: 500, minorBand: "", call: day.crewCall, m1o: "", m1i: "", m2o: "", m2i: "", wrap: "", next: "" }]);
+  const flash = (msg) => { setToast(msg); window.setTimeout(() => setToast(null), 2800); };
+  useEffect(() => { if (SAVED) flash("Restored from this device — resuming Day " + pick("shootDay", 1)); }, []);
+  const syncToSheets = () => {
+    setPeople((list) => list.map((p) => ({
+      ...p,
+      call: p.call || day.crewCall,
+      m1o: p.m1o || log.m1o,
+      m1i: p.m1i || log.m1i,
+      wrap: p.wrap || log.wrap,
+    })));
+    flash("Day times posted to the time cards");
+  };
+  const addPerson = () => {
+    const mi = (profOf("iatse") || {}).mealInt || 6;
+    const c = day.crewCall || "";
+    setPeople((l) => [...l, { id: nid(), name: "", dept: "", profileId: "iatse", rate: 500, minorBand: "", call: c, m1o: c ? addMin(c, mi * 60) : "", m1i: c ? addMin(c, mi * 60 + 60) : "", m2o: "", m2i: "", wrap: "", next: "", restUntil: "" }]);
+  };
+
+  const rollNewDay = () => {
+    if (!armNewDay) {
+      setArmNewDay(true);
+      window.setTimeout(() => setArmNewDay(false), 4000);
+      return;
+    }
+    setArmNewDay(false);
+    setArchive((a) => [...a, { day: shootDay, people: people.map((x) => ({ ...x })), scenes: scenes.map((x) => ({ ...x })), log: { ...log }, dayCfg: { ...day } }]);
+    setViewDay(0);
+    setPeople((list) => list.map((p) => {
+      const r = calcPerson(p, profOf(p.profileId), bands, schoolDay, null);
+      let restUntil = "";
+      if (!r.empty && !r.live && r.earliestNext != null) {
+        const m = ((r.earliestNext % 1440) + 1440) % 1440;
+        restUntil = String(Math.floor(m / 60)).padStart(2, "0") + ":" + String(m % 60).padStart(2, "0");
+      }
+      const nc = p.next || "";
+      const mi = (profOf(p.profileId) || {}).mealInt || 6;
+      return { ...p, call: nc, m1o: nc ? addMin(nc, mi * 60) : "", m1i: nc ? addMin(nc, mi * 60 + 60) : "", m2o: "", m2i: "", wrap: "", next: "", restUntil };
+    }));
+    setLog({ shot: "", m1o: "", m1i: "", wrap: "" });
+    setScenes((l) => l.map((s) => ({ ...s, done: false })));
+    setShootDay((d) => d + 1);
+    flash("Rolled to Day " + (shootDay + 1) + " — sheets cleared, rest windows posted");
+    setCurtain({ run: Date.now(), label: "Shoot Day " + (shootDay + 1), sub: "Fresh sheets — rest windows posted" });
+  };
+
+  const martiniReset = () => {
+    if (!armMartini) {
+      setArmMartini(true);
+      window.setTimeout(() => setArmMartini(false), 4000);
+      return;
+    }
+    setArmMartini(false);
+    setPeople((list) => list.map((x) => ({ ...x, call: "", m1o: "", m1i: "", m2o: "", m2i: "", wrap: "", next: "", restUntil: "" })));
+    setScenes((l) => l.map((x) => ({ ...x, done: false })));
+    setLog({ shot: "", m1o: "", m1i: "", wrap: "" });
+    setArchive([]);
+    setShootDay(1);
+    setViewDay(0);
+    flash("That's a martini — production reset to Day 1");
+    setCurtain({ run: Date.now(), label: "That's a Martini", sub: "Production wrapped — back to day one" });
+  };
+
+  const factoryReset = () => {
+    if (!armFactory) {
+      setArmFactory(true);
+      window.setTimeout(() => setArmFactory(false), 4000);
+      return;
+    }
+    setArmFactory(false);
+    try { if (store) store.removeItem(STORE_KEY); } catch (e) {}
+    setProfiles(DEFAULT_PROFILES); setBands(DEFAULT_BANDS); setSchoolDay(false);
+    setPeople(SAMPLE_PEOPLE); setScenes(SAMPLE_SCENES);
+    setDay({ crewCall: "07:00", firstShot: "08:00", schedWrap: "19:00" });
+    setLog({ shot: "", m1o: "", m1i: "", wrap: "" });
+    setCompanyProfile("iatse"); setFringePct(21); setBudgetTarget(15000);
+    setShootDay(1); setArchive([]); setViewDay(0);
+    flash("Factory reset — sample day restored");
+  };
   const addScene = () => setScenes((l) => [...l, { id: nid(), num: "", slug: "", ie: "INT", dn: "DAY", pages: "", est: 45, done: false }]);
 
   const buildReport = () => {
     const L = [];
-    L.push("DAILY PRODUCTION REPORT — TIME AND COST");
-    L.push("Date " + now.toLocaleDateString() + "   Issued " + now.toLocaleTimeString());
+    const fmtDay = (dayNum, ppl, scn, lg, cfg, isCurrent) => {
+      const rows = ppl.map((x) => ({ p: x, r: calcPerson(x, profOf(x.profileId), bands, schoolDay, isCurrent ? nAbs : null) }));
+      let b = 0, o = 0, mp = 0, fc = 0, tt = 0;
+      L.push("=== SHOOT DAY " + dayNum + (isCurrent ? " (CURRENT)" : "") + " ===");
+      const cc = t2m(cfg.crewCall);
+      L.push("Crew call " + (cc != null ? fClk(cc) : "—") + " / 1st shot " + (lg.shot || "—") + " / Meal " + (lg.m1o || "—") + "-" + (lg.m1i || "—") + " / Wrap " + (lg.wrap || "—"));
+      L.push("Scenes shot: " + (scn.filter((x) => x.done).map((x) => x.num).join(", ") || "none") + " / owed: " + (scn.filter((x) => !x.done).map((x) => x.num).join(", ") || "none"));
+      for (const { p: pp, r } of rows) {
+        if (r.empty) { if (pp.call) L.push((pp.name || "—").slice(0, 26).padEnd(28) + "incomplete — no wrap recorded"); continue; }
+        b += Number(pp.rate) || 0; o += r.otPay; mp += r.meals.amt; fc += r.forcedPen; tt += r.total;
+        L.push(
+          (pp.name || "—").slice(0, 26).padEnd(28) +
+          fHM(r.worked * 60).padEnd(7) +
+          fHM((r.ot1 + r.ot2 + r.ot3) * 60).padEnd(7) +
+          String(r.meals.ct).padEnd(3) + money(r.meals.amt).padEnd(8) +
+          money(r.total)
+        );
+        for (const w of r.warnings) L.push("   ** " + w);
+      }
+      L.push("Day " + dayNum + " labor total " + money(tt));
+      L.push("");
+      return { b, o, mp, fc, tt };
+    };
+    const nDays = archive.length + 1;
+    L.push("PRODUCTION REPORT — " + (archive.length ? "SHOOT DAYS 1-" + shootDay : "SHOOT DAY " + shootDay));
+    L.push("Issued " + now.toLocaleDateString() + "   " + now.toLocaleTimeString());
     L.push("");
-    L.push("Crew call " + fClk(ca) + " / 1st shot " + (log.shot || "—") + " / Meal " + (log.m1o || "—") + "-" + (log.m1i || "—") + " / Wrap " + (log.wrap || "—"));
-    L.push("Scenes completed: " + (scenes.filter((s) => s.done).map((s) => s.num).join(", ") || "none"));
-    L.push("Scenes owed: " + (remaining.map((s) => s.num).join(", ") || "none"));
-    L.push("");
-    L.push("NAME                        HOURS  OT     MP     PAY");
-    for (const { p, r } of calcs) {
-      if (r.empty) continue;
-      L.push(
-        (p.name || "—").slice(0, 26).padEnd(28) +
-        fHM(r.worked * 60).padEnd(7) +
-        fHM((r.ot1 + r.ot2 + r.ot3) * 60).padEnd(7) +
-        String(r.meals.ct).padEnd(3) + money(r.meals.amt).padEnd(8) +
-        money(r.total)
-      );
-      for (const w of r.warnings) L.push("   ** " + w);
-    }
-    L.push("");
-    L.push("Wages " + money(sumBase) + " / OT " + money(sumOT) + " / Meal pen " + money(sumPen) + " / Forced calls " + money(sumForced));
-    L.push("Fringes " + fringePct + "% " + money(fringes) + " / GRAND TOTAL " + money(grand) + (budgetTarget ? " vs target " + money(budgetTarget) : ""));
+    const G = { b: 0, o: 0, mp: 0, fc: 0, tt: 0 };
+    const acc = (t) => { G.b += t.b; G.o += t.o; G.mp += t.mp; G.fc += t.fc; G.tt += t.tt; };
+    for (const a of archive) acc(fmtDay(a.day, a.people, a.scenes, a.log, a.dayCfg, false));
+    acc(fmtDay(shootDay, people, scenes, log, day, true));
+    const gFr = (G.b + G.o) * (Number(fringePct) || 0) / 100;
+    L.push("=== PRODUCTION TOTALS — " + nDays + " DAY" + (nDays > 1 ? "S" : "") + " ===");
+    L.push("Wages " + money(G.b) + " / OT " + money(G.o) + " / Meal pen " + money(G.mp) + " / Forced calls " + money(G.fc));
+    L.push("Fringes " + fringePct + "% " + money(gFr) + " / GRAND TOTAL " + money(G.tt + gFr) + (budgetTarget ? " vs target " + money(budgetTarget * nDays) + " (" + money(budgetTarget) + "/day)" : ""));
     L.push("");
     L.push("Planning estimate from editable presets — confirm against governing agreements before payroll.");
     setReport(L.join("\n"));
@@ -475,7 +708,7 @@ export default function App() {
   const TABS = [["ops", "Day Ops"], ["sheet", "Time Cards"], ["cost", "Ledger"], ["rules", "Rules"]];
 
   return (
-    <div className="mtn">
+    <div className="mtn" onTouchStart={() => {}}>
       <style>{CSS}</style>
 
       {/* ---------- masthead ---------- */}
@@ -484,7 +717,7 @@ export default function App() {
         <div className="masthead">
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
             <div style={{ minWidth: 0 }}>
-              <div className="f-deco mast-title"><span className="mast-star">★ </span>MARTINI<span className="mast-star"> ★</span></div>
+              <div className="f-deco mast-title gold-metal"><span className="mast-star">★ </span>MARTINI<span className="mast-star"> ★</span></div>
               <div className="f-caps mast-sub">Digital First Assistant Director</div>
             </div>
             <div className="clockbox">
@@ -508,7 +741,7 @@ export default function App() {
         {/* ================= DAY OPS ================= */}
         {tab === "ops" && (
           <>
-            <Head>Today's Schedule</Head>
+            <Head>{"Day " + shootDay + " — Schedule"}</Head>
             <div className="grid3">
               <TIn label="Crew call" value={day.crewCall} onChange={(v) => setDay({ ...day, crewCall: v })} />
               <TIn label="Target 1st shot" value={day.firstShot} onChange={(v) => setDay({ ...day, firstShot: v })} />
@@ -596,17 +829,71 @@ export default function App() {
         {/* ================= TIME CARDS ================= */}
         {tab === "sheet" && (
           <>
-            <Head right={<button className="act gold f-caps" onClick={addPerson}><Plus size={12} /> Player</button>}>Time Cards</Head>
-            <div className="smallprint f-caps" style={{ marginBottom: 12 }}>Leave wrap blank = still on the clock, reminders run live</div>
+            <Head right={
+              <div style={{ display: "flex", gap: 8 }}>
+                <button className={"act f-caps" + (armNewDay ? " arm" : "")} onClick={rollNewDay}>{armNewDay ? "Tap again to confirm" : "New Day"}</button>
+                <button className="act gold f-caps" onClick={addPerson}><Plus size={12} /> Player</button>
+              </div>
+            }>{viewDay === 0 ? "Time Cards — Day " + shootDay : "Time Cards — Day " + viewDay + " Archive"}</Head>
+            <div className="smallprint f-caps" style={{ marginBottom: 12 }}>Blank wrap = on the clock, ledger runs live · tap ✕ to clear a time</div>
 
-            {calcs.map(({ p, r }) => {
+            {archive.length > 0 && (
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                {archive.map((a) => (
+                  <button key={a.day} className={"act f-caps" + (viewDay === a.day ? " gold" : "")} style={{ padding: "5px 10px", fontSize: 9 }} onClick={() => setViewDay(a.day)}>Day {a.day}</button>
+                ))}
+                <button className={"act f-caps" + (viewDay === 0 ? " gold" : "")} style={{ padding: "5px 10px", fontSize: 9 }} onClick={() => setViewDay(0)}>Day {shootDay} · today</button>
+              </div>
+            )}
+            {viewDay !== 0 && (() => {
+              const arc = archive.find((a) => a.day === viewDay);
+              if (!arc) return null;
+              const tc = (x) => (x ? fClk(t2m(x)) : "—");
+              const rows = arc.people.map((x) => ({ p: x, r: calcPerson(x, profOf(x.profileId), bands, schoolDay, null) }));
+              let dTotal = 0;
+              for (const { r } of rows) if (!r.empty) dTotal += r.total;
+              return (
+                <>
+                  <div className="smallprint f-caps" style={{ marginBottom: 10 }}>Archived record — read only · scenes shot: {arc.scenes.filter((x) => x.done).map((x) => x.num).join(", ") || "—"}</div>
+                  {rows.map(({ p: pp, r }) => (
+                    <div key={pp.id} className="card">
+                      <div className="bar f-caps"><span>{pp.name || "—"}</span><span>{pp.dept}</span></div>
+                      <div className="inner">
+                        <div className="f-type" style={{ fontSize: 12.5 }}>
+                          Call {tc(pp.call)} · M1 {tc(pp.m1o)}–{tc(pp.m1i)}{pp.m2o ? " · M2 " + tc(pp.m2o) + "–" + tc(pp.m2i) : ""} · Wrap {tc(pp.wrap)}
+                        </div>
+                        {!r.empty ? (
+                          <div className="f-type" style={{ marginTop: 6, fontSize: 12.5, borderTop: "1px solid var(--edge)", paddingTop: 6 }}>
+                            Worked <b>{fHM(r.worked * 60)}</b> · OT <b>{fHM((r.ot1 + r.ot2 + r.ot3) * 60)}</b> · MP <b>{r.meals.ct}</b> · Pay <b style={{ color: "var(--green)" }}>{money2(r.total)}</b>
+                          </div>
+                        ) : (
+                          pp.call ? <div className="smallprint f-caps" style={{ marginTop: 5 }}>Incomplete — no wrap recorded, excluded from totals</div> : null
+                        )}
+                        {!r.empty && r.warnings.length > 0 && (
+                          <div style={{ marginTop: 4 }}>{r.warnings.map((w, i) => <span key={i} className="stamp f-caps">{w}</span>)}</div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  <div className="card">
+                    <div className="inner f-type" style={{ display: "flex", justifyContent: "space-between", fontSize: 15, fontWeight: 700 }}>
+                      <span className="f-caps" style={{ letterSpacing: ".14em" }}>Day {arc.day} labor</span>
+                      <span style={{ color: "var(--green)" }}>{money2(dTotal)}</span>
+                    </div>
+                  </div>
+                </>
+              );
+            })()}
+
+            {viewDay === 0 && calcs.map(({ p, r }) => {
               const prof = profOf(p.profileId);
               const rest = nextRest(p, r, prof, schoolDay, nAbs);
+              const proj = !r.empty && r.sched != null ? calcPerson(p, prof, bands, schoolDay, null) : null;
               const hasOT = !r.empty && r.ot1 + r.ot2 + r.ot3 > 0;
               return (
                 <div key={p.id} className="card">
                   <div className="bar f-caps">
-                    <span>Player Time Card{r.live ? " — on the clock" : ""}</span>
+                    <span>Player Time Card{r.empty ? "" : r.live ? (r.sched != null ? " — on set" : " — on the clock") : nAbs < r.c ? " — standby" : " — wrapped"}</span>
                     <button style={{ color: "var(--paper)", background: "none", border: 0 }} onClick={() => setPeople((l) => l.filter((x) => x.id !== p.id))}><Trash2 size={13} /></button>
                   </div>
                   <div className="inner">
@@ -629,31 +916,51 @@ export default function App() {
                       </Fld>
                     </div>
                     <div className="grid2" style={{ marginTop: 10 }}>
-                      <TIn label="Call" value={p.call} onChange={(v) => updPerson(p.id, { call: v })} />
+                      <TIn label="Call" value={p.call} onChange={(v) => {
+                        const mi = prof ? prof.mealInt : 6;
+                        updPerson(p.id, v ? { call: v, m1o: addMin(v, mi * 60), m1i: addMin(v, mi * 60 + 60) } : { call: v });
+                      }} />
                       <TIn label="Wrap" value={p.wrap} onChange={(v) => updPerson(p.id, { wrap: v })} />
                       <TIn label="Meal 1 out" value={p.m1o} onChange={(v) => updPerson(p.id, { m1o: v })} />
                       <TIn label="Meal 1 in" value={p.m1i} onChange={(v) => updPerson(p.id, { m1i: v })} />
                       <TIn label="Meal 2 out" value={p.m2o} onChange={(v) => updPerson(p.id, { m2o: v })} />
                       <TIn label="Meal 2 in" value={p.m2i} onChange={(v) => updPerson(p.id, { m2i: v })} />
                       <TIn label="Tomorrow's call" value={p.next} onChange={(v) => updPerson(p.id, { next: v })} />
-                      <Fld label="Rest clear">
-                        <div className="fld f-type" style={{ borderBottomStyle: "dashed" }}>{r.empty ? "—" : fClk(r.earliestNext)}</div>
-                      </Fld>
+                      <TIn label="Rest until (prev day)" value={p.restUntil || ""} onChange={(v) => updPerson(p.id, { restUntil: v })} />
                     </div>
 
+                    {p.restUntil && (r.empty || (t2m(p.call) != null && nowMin < t2m(p.call))) && (() => {
+                      const ruv = t2m(p.restUntil);
+                      const cleared = nowMin >= ruv;
+                      return (
+                        <Ticket side="TURNAROUND" tone={cleared ? "ok" : ""}
+                          title={"Rest clears " + fClk(ruv)}
+                          big={cleared ? "REST COMPLETE — OK to call" : "Resting — " + countdown(ruv - nowMin) + " to clear"} />
+                      );
+                    })()}
                     {rest && (
                       <Ticket side="REST CALL" tone={rest.at - nAbs < 30 ? "warn" : ""}
                         title={"Next rest — " + fClk(rest.at)}
                         big={rest.label}
                         sub={"in " + countdown(rest.at - nAbs)} />
                     )}
-                    {!r.empty && !r.live && r.earliestNext != null && (
-                      <div><span className="stamp green f-caps">Resting — clear {fClk(r.earliestNext)} ({prof.turnaround}h)</span></div>
+                    {!r.empty && r.live && r.sched != null && (
+                      <div><span className="stamp ink f-caps">On set — sched. wrap {fClk(r.sched)} · billing live</span></div>
                     )}
+                    {!r.empty && !r.live && (() => {
+                      if (nAbs < r.c) return (
+                        <div><span className="stamp ink f-caps">Standby — call {fClk(r.c)}</span></div>
+                      );
+                      return r.earliestNext != null ? (
+                        <div><span className="stamp green f-caps">Resting — clear {fClk(r.earliestNext)} ({prof.turnaround}h)</span></div>
+                      ) : (
+                        <div><span className="stamp ink f-caps">Wrapped {fClk(r.end)}</span></div>
+                      );
+                    })()}
 
                     {!r.empty && (
                       <div className="f-type" style={{ marginTop: 8, fontSize: 12.5, borderTop: "1px solid var(--edge)", paddingTop: 7 }}>
-                        Worked <b>{fHM(r.worked * 60)}</b> · OT <b style={hasOT ? { color: "var(--gold2)" } : {}}>{fHM((r.ot1 + r.ot2 + r.ot3) * 60)}</b> · MP <b style={r.meals.ct ? { color: "var(--stamp)" } : {}}>{r.meals.ct}</b> · Pay <b style={{ color: "var(--green)" }}>{money(r.total)}</b>
+                        Worked <b>{fHM(r.worked * 60)}</b> · OT <b style={hasOT ? { color: "var(--gold2)" } : {}}>{fHM((r.ot1 + r.ot2 + r.ot3) * 60)}</b> · MP <b style={r.meals.ct ? { color: "var(--stamp)" } : {}}>{r.meals.ct}</b> · Pay <b style={{ color: "var(--green)" }}>{money2(r.meter)}</b>{proj && !proj.empty ? <span> · full-day proj. <b>{money(proj.total)}</b></span> : null}
                       </div>
                     )}
                     {!r.empty && r.warnings.length > 0 && (
@@ -679,7 +986,7 @@ export default function App() {
             <div className="card" style={{ boxShadow: "none" }}>
               <div style={{ overflowX: "auto" }}>
                 <table className="ledger">
-                  <thead><tr><th>Name</th><th>Base</th><th>OT</th><th>Pen.</th><th>Total</th></tr></thead>
+                  <thead><tr><th>Name</th><th>Base</th><th>OT</th><th>Pen.</th><th>Now</th></tr></thead>
                   <tbody>
                     {calcs.map(({ p, r }) => r.empty ? null : (
                       <tr key={p.id}>
@@ -687,18 +994,23 @@ export default function App() {
                         <td>{money(p.rate)}</td>
                         <td style={r.otPay ? { color: "var(--gold2)" } : {}}>{money(r.otPay)}</td>
                         <td style={r.meals.amt + r.forcedPen ? { color: "var(--stamp)" } : {}}>{money(r.meals.amt + r.forcedPen)}</td>
-                        <td>{money(r.total)}</td>
+                        <td>{r.live ? <span style={{ color: "var(--gold2)" }}>&#9679; </span> : null}{money2(r.meter)}</td>
                       </tr>
                     ))}
                   </tbody>
                   <tfoot>
-                    <tr><td className="f-caps">Total</td><td>{money(sumBase)}</td><td>{money(sumOT)}</td><td>{money(sumPen + sumForced)}</td><td>{money(sumTotal)}</td></tr>
+                    <tr><td className="f-caps">Total</td><td>{money(sumBase)}</td><td>{money(sumOT)}</td><td>{money(sumPen + sumForced)}</td><td>{money2(sumMeter)}</td></tr>
                   </tfoot>
                 </table>
               </div>
             </div>
             <div className="card">
               <div className="inner f-type" style={{ fontSize: 13 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 17, fontWeight: 700 }}>
+                  <span className="f-caps" style={{ letterSpacing: ".14em" }}>On the Meter</span>
+                  <span style={{ color: "var(--gold2)" }}>{money2(meterGrand)}</span>
+                </div>
+                <div className="smallprint f-caps" style={{ marginBottom: 8 }}>live labor cost to this second, incl. fringes</div>
                 <div style={{ display: "flex", justifyContent: "space-between" }}><span>Fringes {fringePct}%</span><span>{money(fringes)}</span></div>
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 17, fontWeight: 700, marginTop: 6, borderTop: "3px double var(--ink)", paddingTop: 6 }}>
                   <span className="f-caps" style={{ letterSpacing: ".14em" }}>Day Total</span>
@@ -782,6 +1094,23 @@ export default function App() {
                 </div>
               </div>
             </div>
+            <div className="card">
+              <div className="bar f-caps"><span>Production Controls</span></div>
+              <div className="inner">
+                <button className={"act f-caps" + (armMartini ? " arm" : "")} style={{ width: "100%", justifyContent: "center", padding: "11px" }} onClick={martiniReset}>
+                  {armMartini ? "Tap again — wipe all days" : "That's a Martini — reset to Day 1"}
+                </button>
+                <div className="smallprint" style={{ marginTop: 8, lineHeight: 1.5 }}>
+                  Wraps the production: clears every archived day and all times, returns to Day 1. Roster, rates and rules are kept.
+                </div>
+                <button className={"act f-caps" + (armFactory ? " arm" : "")} style={{ width: "100%", justifyContent: "center", padding: "9px", marginTop: 10 }} onClick={factoryReset}>
+                  {armFactory ? "Tap again — erase device data" : "Factory reset — erase saved data"}
+                </button>
+                <div className="smallprint" style={{ marginTop: 8, lineHeight: 1.5 }}>
+                  Erases everything autosaved on this device and restores the sample day, roster included.
+                </div>
+              </div>
+            </div>
             <div className="smallprint" style={{ lineHeight: 1.6 }}>
               Meals under 30 min stay on the clock; up to 60 min per meal deducts. First meal runs off call time, second off end of first. NDBs, grace, extensions, 6th/7th day, travel and distant location are not modeled — see your paymaster. Data lives only in this session.
             </div>
@@ -791,8 +1120,15 @@ export default function App() {
         <div className="footer">
           <div className="f-script" style={{ fontSize: 20, color: "var(--faded)" }}>that's a wrap</div>
           <div className="smallprint f-caps" style={{ marginTop: 4 }}>Form 1-AD · Property of the Production · All times local</div>
+          <div className="smallprint f-caps" style={{ marginTop: 4 }}>{store ? "Autosave: on — data lives in this browser" : "Autosave: off in preview — deploy to enable"}</div>
         </div>
       </div>
+
+      {toast && (
+        <div style={{ position: "fixed", left: 0, right: 0, bottom: 20, display: "flex", justifyContent: "center", zIndex: 40, pointerEvents: "none" }}>
+          <div className="stamp green f-caps" style={{ background: "var(--paper)", boxShadow: "3px 3px 0 rgba(35,29,18,.3)", fontSize: 10.5, padding: "7px 13px", transform: "rotate(-1deg)", margin: 0 }}>{toast}</div>
+        </div>
+      )}
 
       {/* ---------- wrap report ---------- */}
       {report != null && (
@@ -806,6 +1142,10 @@ export default function App() {
             <div className="smallprint f-caps" style={{ padding: "8px 12px", borderTop: "1px solid var(--edge)" }}>Long-press to select and copy</div>
           </div>
         </div>
+      )}
+
+      {curtain && (
+        <Curtain key={curtain.run} label={curtain.label} sub={curtain.sub} onDone={() => setCurtain(null)} />
       )}
     </div>
   );
